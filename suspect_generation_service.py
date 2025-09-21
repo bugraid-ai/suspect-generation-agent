@@ -19,6 +19,7 @@ from enum import Enum
 from dataclasses import dataclass, asdict
 
 import boto3
+import httpx
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
@@ -32,6 +33,13 @@ logger = logging.getLogger(__name__)
 # Configuration
 AWS_REGION = os.getenv("AWS_REGION", "ap-southeast-1")
 SQS_QUEUE_URL = os.getenv("SQS_QUEUE_URL", "https://sqs.ap-southeast-1.amazonaws.com/123456789012/suspects-queue")
+
+# Hybrid Search configuration
+HYBRID_SEARCH_URL = os.getenv("HYBRID_SEARCH_API_URL", "http://localhost:8010")
+HYBRID_SEARCH_PATH = os.getenv("HYBRID_SEARCH_API_PATH", "/hybrid/test")
+
+# RCA Agent configuration
+RCA_AGENT_URL = os.getenv("RCA_AGENT_API_URL", "http://localhost:8001")
 
 class SuspectType(Enum):
     """Types of root cause suspects"""
@@ -84,6 +92,10 @@ class WorkflowState(TypedDict):
     anomalies: List[Dict[str, Any]]
     context: Dict[str, Any]
     suspects: List[Suspect]
+    historical_context: List[Dict[str, Any]]
+    rca_result: Optional[Dict[str, Any]]
+    alert_data: Dict[str, Any]
+    telemetry: Dict[str, Any]
     messages: Annotated[List[AnyMessage], add_messages]
 
 class SuspectGenerationService:
@@ -111,13 +123,17 @@ class SuspectGenerationService:
         workflow.add_node("analyze_anomalies", self.analyze_anomalies_node)
         workflow.add_node("generate_suspects", self.generate_suspects_node)
         workflow.add_node("rank_suspects", self.rank_suspects_node)
+        workflow.add_node("fetch_historical_context", self.fetch_historical_context_node)
+        workflow.add_node("trigger_rca_analysis", self.trigger_rca_analysis_node)
         workflow.add_node("send_to_sqs", self.send_to_sqs_node)
         
         # Add edges
         workflow.add_edge(START, "analyze_anomalies")
         workflow.add_edge("analyze_anomalies", "generate_suspects")
         workflow.add_edge("generate_suspects", "rank_suspects")
-        workflow.add_edge("rank_suspects", "send_to_sqs")
+        workflow.add_edge("rank_suspects", "fetch_historical_context")
+        workflow.add_edge("fetch_historical_context", "trigger_rca_analysis")
+        workflow.add_edge("trigger_rca_analysis", "send_to_sqs")
         workflow.add_edge("send_to_sqs", END)
         
         return workflow.compile()
@@ -349,43 +365,234 @@ class SuspectGenerationService:
         
         return state
     
+    async def fetch_historical_context_node(self, state: WorkflowState) -> WorkflowState:
+        """Fetch historical context using hybrid search"""
+        logger.info(f"Fetching historical context for incident {state['incident_id']}")
+        
+        try:
+            # Prepare alerts for hybrid search
+            alerts_for_search = []
+            
+            # Add current incident alert data
+            if state.get("alert_data"):
+                alerts_for_search.append(state["alert_data"])
+            
+            # Add suspect information as search context
+            for suspect in state["suspects"]:
+                suspect_alert = {
+                    "title": suspect.title,
+                    "description": suspect.description,
+                    "service": {"name": state.get("context", {}).get("service", "")},
+                    "company_id": state.get("alert_data", {}).get("company_id", ""),
+                    "incident_id": state["incident_id"],
+                    "environment": os.getenv("ENVIRONMENT", "development"),
+                    "tags": [suspect.type.value]
+                }
+                alerts_for_search.append(suspect_alert)
+            
+            # Call hybrid search
+            historical_context = await self._call_hybrid_search(alerts_for_search)
+            state["historical_context"] = historical_context
+            
+            logger.info(f"Fetched {len(historical_context)} historical incidents for context")
+            
+        except Exception as e:
+            logger.error(f"Failed to fetch historical context: {e}")
+            state["historical_context"] = []
+        
+        return state
+    
+    async def _call_hybrid_search(self, alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Call the hybrid search service to get historical context"""
+        if not HYBRID_SEARCH_URL:
+            logger.warning("Hybrid search URL not configured")
+            return []
+        
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # Build query from alerts
+                query_parts = []
+                for alert in alerts:
+                    title = alert.get("title", "")
+                    description = alert.get("description", "")
+                    service = alert.get("service", {})
+                    service_name = service.get("name", "") if isinstance(service, dict) else str(service)
+                    
+                    parts = [p for p in [title, service_name, description] if p]
+                    if parts:
+                        query_parts.append(" — ".join(parts))
+                
+                query_text = " | ".join(query_parts[:3])  # Limit to top 3 for performance
+                
+                # Prepare hybrid search request
+                search_request = {
+                    "alerts": alerts,
+                    "environment": os.getenv("ENVIRONMENT", "development")
+                }
+                
+                url = f"{HYBRID_SEARCH_URL.rstrip('/')}{HYBRID_SEARCH_PATH}"
+                response = await client.post(url, json=search_request)
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    hits = result.get("hits", [])
+                    
+                    # Extract relevant information from search results
+                    historical_incidents = []
+                    for hit in hits:
+                        historical_incidents.append({
+                            "incident_id": hit.get("incident_id", ""),
+                            "title": hit.get("title", ""),
+                            "resolution": hit.get("resolution", ""),
+                            "root_cause": hit.get("root_cause", ""),
+                            "similarity_score": hit.get("similarity_score", 0),
+                            "service": hit.get("service", ""),
+                            "timestamp": hit.get("timestamp", "")
+                        })
+                    
+                    return historical_incidents
+                else:
+                    logger.warning(f"Hybrid search returned {response.status_code}: {response.text}")
+                    return []
+                    
+        except Exception as e:
+            logger.error(f"Error calling hybrid search: {e}")
+            return []
+    
+    async def trigger_rca_analysis_node(self, state: WorkflowState) -> WorkflowState:
+        """Trigger RCA analysis with suspects and historical context"""
+        logger.info(f"Triggering RCA analysis for incident {state['incident_id']}")
+        
+        try:
+            # Prepare RCA request
+            rca_request = {
+                "incident_id": state["incident_id"],
+                "suspects": [
+                    {
+                        "id": suspect.id,
+                        "type": suspect.type.value,
+                        "title": suspect.title,
+                        "description": suspect.description,
+                        "confidence": suspect.confidence,
+                        "severity": suspect.severity.value,
+                        "evidence": suspect.evidence,
+                        "suggested_actions": suspect.suggested_actions,
+                        "metadata": suspect.metadata
+                    }
+                    for suspect in state["suspects"]
+                ],
+                "alert_data": state.get("alert_data", {}),
+                "telemetry": state.get("telemetry", {}),
+                "context": state.get("context", {}),
+                "session_id": state.get("context", {}).get("session_id"),
+                "causal_graph": {}
+            }
+            
+            # Call RCA agent
+            rca_result = await self._call_rca_agent(rca_request)
+            state["rca_result"] = rca_result
+            
+            logger.info(f"RCA analysis completed for incident {state['incident_id']}")
+            
+        except Exception as e:
+            logger.error(f"Failed to trigger RCA analysis: {e}")
+            state["rca_result"] = None
+        
+        return state
+    
+    async def _call_rca_agent(self, rca_request: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Call the RCA agent service"""
+        if not RCA_AGENT_URL:
+            logger.warning("RCA agent URL not configured")
+            return None
+        
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:  # Longer timeout for RCA
+                url = f"{RCA_AGENT_URL.rstrip('/')}/analyze-incident"
+                response = await client.post(url, json=rca_request)
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    logger.info(f"RCA analysis successful: {result.get('rca_id', 'unknown')}")
+                    return result
+                else:
+                    logger.warning(f"RCA agent returned {response.status_code}: {response.text}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Error calling RCA agent: {e}")
+            return None
+    
     async def send_to_sqs_node(self, state: WorkflowState) -> WorkflowState:
-        """Send suspects to SQS queue"""
-        logger.info(f"Sending {len(state['suspects'])} suspects to SQS")
+        """Send comprehensive analysis results to SQS queue"""
+        logger.info(f"Sending analysis results for incident {state['incident_id']} to SQS")
         
         if not self.sqs_client or not SQS_QUEUE_URL:
             logger.warning("SQS client or queue URL not configured, skipping SQS send")
             return state
         
         try:
-            for suspect in state["suspects"]:
-                message_body = json.dumps(asdict(suspect), default=str)
-                
-                response = self.sqs_client.send_message(
-                    QueueUrl=SQS_QUEUE_URL,
-                    MessageBody=message_body,
-                    MessageAttributes={
-                        'incident_id': {
-                            'StringValue': suspect.incident_id,
-                            'DataType': 'String'
-                        },
-                        'suspect_type': {
-                            'StringValue': suspect.type.value,
-                            'DataType': 'String'
-                        },
-                        'severity': {
-                            'StringValue': suspect.severity.value,
-                            'DataType': 'String'
-                        }
+            # Prepare comprehensive message with suspects, historical context, and RCA results
+            comprehensive_message = {
+                "message_type": "SUSPECT_GENERATION_COMPLETE",
+                "incident_id": state["incident_id"],
+                "suspects_count": len(state["suspects"]),
+                "suspects": [
+                    {
+                        "id": suspect.id,
+                        "type": suspect.type.value,
+                        "title": suspect.title,
+                        "description": suspect.description,
+                        "confidence": suspect.confidence,
+                        "severity": suspect.severity.value,
+                        "evidence": suspect.evidence,
+                        "suggested_actions": suspect.suggested_actions,
+                        "metadata": suspect.metadata
                     }
-                )
-                
-                logger.debug(f"Sent suspect {suspect.id} to SQS: {response['MessageId']}")
+                    for suspect in state["suspects"]
+                ],
+                "historical_context": state.get("historical_context", []),
+                "historical_context_count": len(state.get("historical_context", [])),
+                "rca_result": state.get("rca_result"),
+                "rca_completed": state.get("rca_result") is not None,
+                "timestamp": datetime.utcnow().isoformat(),
+                "environment": os.getenv("ENVIRONMENT", "development")
+            }
             
-            logger.info(f"Successfully sent {len(state['suspects'])} suspects to SQS")
+            # Send comprehensive message
+            message_body = json.dumps(comprehensive_message, default=str)
+            
+            response = self.sqs_client.send_message(
+                QueueUrl=SQS_QUEUE_URL,
+                MessageBody=message_body,
+                MessageAttributes={
+                    'incident_id': {
+                        'StringValue': state["incident_id"],
+                        'DataType': 'String'
+                    },
+                    'message_type': {
+                        'StringValue': 'SUSPECT_GENERATION_COMPLETE',
+                        'DataType': 'String'
+                    },
+                    'suspects_count': {
+                        'StringValue': str(len(state["suspects"])),
+                        'DataType': 'Number'
+                    },
+                    'rca_completed': {
+                        'StringValue': str(state.get("rca_result") is not None),
+                        'DataType': 'String'
+                    },
+                    'environment': {
+                        'StringValue': os.getenv("ENVIRONMENT", "development"),
+                        'DataType': 'String'
+                    }
+                }
+            )
+            
+            logger.info(f"Successfully sent comprehensive analysis results to SQS: {response['MessageId']}")
             
         except Exception as e:
-            logger.error(f"Error sending suspects to SQS: {e}")
+            logger.error(f"Error sending analysis results to SQS: {e}")
         
         return state
     
@@ -400,6 +607,10 @@ class SuspectGenerationService:
             anomalies=request.anomalies,
             context=request.context,
             suspects=[],
+            historical_context=[],
+            rca_result=None,
+            alert_data=request.context.get("alert_data", {}),
+            telemetry=request.context.get("telemetry", {}),
             messages=[]
         )
         
