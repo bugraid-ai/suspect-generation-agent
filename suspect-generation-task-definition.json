@@ -1,0 +1,54 @@
+{
+  "family": "suspect-generation-service",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::574778231660:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::574778231660:role/ecsTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "suspect-generation",
+      "image": "574778231660.dkr.ecr.ap-southeast-1.amazonaws.com/suspect-generation-service:latest",
+      "portMappings": [
+        {
+          "containerPort": 8000,
+          "protocol": "tcp"
+        }
+      ],
+      "essential": true,
+      "environment": [
+        {
+          "name": "AWS_REGION",
+          "value": "ap-southeast-1"
+        },
+        {
+          "name": "SQS_QUEUE_URL",
+          "value": "https://sqs.ap-southeast-1.amazonaws.com/574778231660/suspects-queue"
+        },
+        {
+          "name": "ENVIRONMENT",
+          "value": "development"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/suspect-generation-service",
+          "awslogs-region": "ap-southeast-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "curl -f http://localhost:8000/health || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      }
+    }
+  ]
+}
